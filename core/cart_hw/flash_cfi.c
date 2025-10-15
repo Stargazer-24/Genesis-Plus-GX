@@ -49,6 +49,13 @@
 
 #define CFI_QUERY_TABLE_LEN 45
 
+#define CFI_TABLE_NUM_REGIONS_INDEX 0x1c
+#define CFI_TABLE_REGIONS_DATA_INDEX 0x1d
+
+#define EXT_DATA_LEN 256
+#define EXT_DATA_ADDR_MASK 0xff
+
+
 typedef enum
 {
   FLASH_READ = 0,
@@ -66,8 +73,10 @@ typedef struct
   uint32 data;            /* latched data register */
   T_CFI_MODE mode;        /* current operating mode */
   const uint8 *cfi_data;  /* CFI query data array */
+  uint16 ext_data[EXT_DATA_LEN/2]; /* Extended Block aka Secured Silicon Sector region */
   const uint16 *id;       /* Manufacturer & Device id codes */
   uint8 readmask;         /* Autoselect mode read address mask */
+  uint8 ext_mode;         /* Extended Block access mode */
 } T_FLASH_CFI;
 
 static T_FLASH_CFI flash;
@@ -110,6 +119,7 @@ static const uint8 flash_readmask[MAX_FLASH_CFI_SUPPORTED_TYPES] =
 void flash_cfi_init(T_FLASH_CFI_TYPE type)
 {
   memset(&flash, 0x00, sizeof(flash));
+  memset(flash.ext_data, 0xff, sizeof(flash.ext_data));
   flash.cfi_data  = cfi_query[type];
   flash.id        = flash_id[type];
   flash.readmask  = flash_readmask[type];
@@ -120,24 +130,47 @@ void flash_cfi_write(unsigned int address, unsigned int data)
   if (flash.mode == FLASH_PROGRAM)
   {
     /* can only clear bits set to 1 in unprotected sectors (for simplicity, assume only backup RAM area is not protected) */
-    if (m68k.memory_map[(address>>15)&0xff].base == sram.sram)
+    if (!flash.ext_mode )
     {
-      WRITE_WORD(sram.sram, (address << 1) & 0xfffe, data & READ_WORD(sram.sram, (address << 1) & 0xfffe));
+      if (m68k.memory_map[(address>>15)&0xff].base == sram.sram)
+      {
+        WRITE_WORD(sram.sram, (address << 1) & 0xfffe, data & READ_WORD(sram.sram, (address << 1) & 0xfffe));
+      }
+      else
+      {
+        for (int i=0x00; i<0x80; i++)
+        {
+          if (m68k.memory_map[i].base == sram.sram)
+          {
+            /* disable prevoius SRAM bank */
+            m68k.memory_map[i].base = cart.rom + (i << 16);
+            break;
+          }
+        }
+        /* switch to another SRAM bank */
+        m68k.memory_map[(address>>15)&0xff].base  = sram.sram;
+        memset(sram.sram, 0xff, sizeof(sram.sram));
+        WRITE_WORD(sram.sram, (address << 1) & 0xfffe, data & READ_WORD(sram.sram,(address << 1) & 0xfffe)); 
+      }
     }
-
     /* reset to read mode */
     flash.mode = FLASH_READ;
   }
   else
   {
-    /* only A0-A11 and D0-D7 are decoded */
-    address &= 0xfff;
+    /* for commands, only A0-A11 and D0-D7 are decoded */
     data &= 0xff;
 
     /* detect RESET command */
     if (data == 0xf0)
     {
       /* reset to read mode */
+      flash.mode = FLASH_READ;
+    }
+    else if (flash.ext_mode && (flash.mode == FLASH_AUTOSELECT) && (data == 0))
+    {
+      /* Exit Extended Block/Secured Silicon Sector Region */
+      flash.ext_mode = 0;
       flash.mode = FLASH_READ;
     }
     else
@@ -147,7 +180,7 @@ void flash_cfi_write(unsigned int address, unsigned int data)
         case FLASH_UNLOCKED:
         {
           /* detect supported commands */
-          if (address == 0x555)
+          if ((address & 0xfff) == 0x555)
           {
             if (data == 0x80)
             {
@@ -164,6 +197,12 @@ void flash_cfi_write(unsigned int address, unsigned int data)
               /* PROGRAM command */
               flash.mode = FLASH_PROGRAM;
             }
+            else if (data == 0x88)
+            {
+              /* Enter Extended Block/Secured Silicon Sector Region command */
+              flash.ext_mode = 1;
+              flash.mode = FLASH_READ;
+            }
           }
           break;
         }
@@ -171,7 +210,7 @@ void flash_cfi_write(unsigned int address, unsigned int data)
         case FLASH_ERASE_INIT:
         {
           /* detect UNLOCK sequence */
-          if ((flash.addr == 0x555) && (flash.data == 0xAA) && (address == 0x2AA) && (data == 0x55))
+          if ((flash.addr == 0x555) && (flash.data == 0xAA) && ((address & 0xfff) == 0x2AA) && (data == 0x55))
           {
             flash.mode = FLASH_ERASE_UNLOCKED;
           }
@@ -181,7 +220,7 @@ void flash_cfi_write(unsigned int address, unsigned int data)
         case FLASH_ERASE_UNLOCKED:
         {
           /* detect CHIP ERASE command */
-          if ((address == 0x555) && (data == 0x10))
+          if (((address & 0xfff) == 0x555) && (data == 0x10))
           {
             int i;
 
@@ -219,13 +258,13 @@ void flash_cfi_write(unsigned int address, unsigned int data)
         default:
         {
           /* detect UNLOCK sequence */
-          if ((flash.addr == 0x555) && (flash.data == 0xAA) && (address == 0x2AA) && (data == 0x55))
+          if ((flash.addr == 0x555) && (flash.data == 0xAA) && ((address & 0xfff) == 0x2AA) && (data == 0x55))
           {
             flash.mode = FLASH_UNLOCKED;
           }
 
           /* detect CFI QUERY command */
-          else if ((address == 0x55) && (data == 0x98))
+          else if (((address & 0xfff) == 0x55) && (data == 0x98))
           {
             flash.mode = FLASH_CFI_QUERY;
           }
@@ -236,12 +275,18 @@ void flash_cfi_write(unsigned int address, unsigned int data)
   }
 
   /* latch address & data */
-  flash.addr = address;
+  flash.addr = address & 0xfff;
   flash.data = data;
 }
 
 unsigned int flash_cfi_read(unsigned int address)
 {
+  if (flash.ext_mode)
+  {
+     /* Read from Extended Block/Secured Silicon Sector Region */
+     return flash.ext_data[address & EXT_DATA_ADDR_MASK];
+  }
+
   /* detect current mode */
   if (flash.mode == FLASH_AUTOSELECT)
   {
@@ -259,7 +304,7 @@ unsigned int flash_cfi_read(unsigned int address)
       return flash.cfi_data[index];
     }
   }
-  
+
   /* default read (might be possible only in READ mode ?) */
   if (m68k.memory_map[(address>>15)&0xff].base == sram.sram)
   {
@@ -280,6 +325,7 @@ int flash_cfi_context_save(uint8 *state)
   save_param(&flash.addr, sizeof(flash.addr));
   save_param(&flash.data, sizeof(flash.data));
   save_param(&flash.mode, sizeof(flash.mode));
+  save_param(&flash.ext_mode, sizeof(flash.ext_mode));
 
   return bufferptr;
 }
@@ -291,6 +337,12 @@ int flash_cfi_context_load(uint8 *state)
   load_param(&flash.addr, sizeof(flash.addr));
   load_param(&flash.data, sizeof(flash.data));
   load_param(&flash.mode, sizeof(flash.mode));
+  load_param(&flash.ext_mode, sizeof(flash.ext_mode));
 
   return bufferptr;
+}
+
+void flash_cfi_load_ext_data(const void *data, unsigned int len)
+{
+  memcpy(flash.ext_data, data, (len < sizeof(flash.ext_data) ? len : sizeof(flash.ext_data)));
 }
